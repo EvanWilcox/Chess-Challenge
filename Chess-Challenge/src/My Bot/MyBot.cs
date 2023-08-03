@@ -1,11 +1,14 @@
 ﻿using System.Linq;
+using System.Collections.Generic;
 using ChessChallenge.API;
+using System;
 
-public class TimeUpV5 : System.Exception { }
+public class TimeUpV6 : System.Exception { }
 
-public class MyBotV5 : IChessBot
+
+public class MyBotV6 : IChessBot
 {
-    private const sbyte EXACT = 0, LOWERBOUND = -1, UPPERBOUND = 1, INVALID = -2;
+    private const int OPENING = 0, MIDDLE = 1, ENDGAME = 2;
 
     private static readonly ulong[,] packedScores =
     {
@@ -19,96 +22,127 @@ public class MyBotV5 : IChessBot
         {0xCE1413EBFFEBCE00, 0xE21E1DF5FFF5D800, 0xE20A09F5FFF5E200, 0xE1FFFFFB04F5E200},
     };
 
-    private int PieceScore(int type, bool isWhite, int rank, int file)
+    private static readonly int[,] mvv_lva =
     {
-        //Because the arrays are 8x4, we need to mirror across the files.
+        {105,205,305,405,505},
+        {104,204,304,404,504},
+        {103,203,303,403,503},
+        {102,202,302,402,502},
+        {101,201,301,401,501},
+        {100,200,300,400,500},
+    };
+
+    private const sbyte EXACT = 0, LOWERBOUND = -1, UPPERBOUND = 1, INVALID = -2;
+
+    public struct Transposition
+    {
+        public Transposition(ulong zHash, double eval, int d)
+        {
+            zobristHash = zHash;
+            evaluation = eval;
+            depth = d;
+            move = Move.NullMove;
+            flag = INVALID;
+        }
+
+        public ulong zobristHash = 0;
+        public double evaluation = 0;
+        public int depth = 0;
+        public Move move = Move.NullMove;
+        public int flag = INVALID;
+    };
+
+
+    private static ulong k_TpMask = 0x7FFFFF; //4.7 million entries, likely consuming about 151 MB
+
+    private Transposition[] m_TPTable = new Transposition[k_TpMask + 1];
+
+    private int PieceSquareScore(int type, bool isWhite, int rank, int file)
+    {
         if (file > 3) file = 7 - file;
-        //Additionally, if we're checking black pieces, we need to flip the board vertically.
         if (!isWhite) rank = 7 - rank;
-        int unpackedData = 0;
-        // ulong bytemask = 0xFF;
-        //first we shift the mask to select the correct byte              ↓
-        //We then bitwise-and it with PackedScores            ↓
-        //We finally have to "un-shift" the resulting data to properly convert back       ↓
-        //We convert the result to an sbyte, then to an int, to ensure it converts properly.
-        unpackedData = (sbyte)((packedScores[rank, file] >> 8 * ((int)type - 1)) & 0xFF);
-        unpackedData = (sbyte)((byte)unpackedData | (0b10000000 & unpackedData));
-        //inverting eval scores for black pieces
-        if (!isWhite) unpackedData *= -1;
-        return unpackedData;
+        sbyte unpackedData = unchecked((sbyte)((packedScores[rank, file] >> 8 * ((int)type - 1)) & 0xFF));
+        return isWhite ? unpackedData : -unpackedData;
     }
 
-    int[] PIECE_SCORES = new[] { 100, 300, 310, 500, 900, 10000 };
-    // int MAX_DEPTH = 7;
-    int TIME_PER_MOVE = 1000;
+    int[] PIECE_VALUES = { 100, 300, 310, 500, 900, 10000 };
 
-    double evaluate(Board board)
+
+    double evaluate(Board board, bool color)
     {
         double material = 0;
         double position = 0;
-        PieceList[] pieces = board.GetAllPieceLists();
 
-        foreach (PieceList piece_list in pieces)
+        PieceList[] pieceLists = board.GetAllPieceLists();
+
+        foreach (PieceList piece_list in pieceLists)
             foreach (Piece piece in piece_list)
             {
-                material += PIECE_SCORES[(int)piece.PieceType - 1] * (piece.IsWhite ? 1 : -1);
-                position += PieceScore((int)piece.PieceType - 1, piece.IsWhite, piece.Square.Rank, piece.Square.File);
+                material += PIECE_VALUES[(int)piece.PieceType - 1] * (piece.IsWhite ? 1 : -1);
+                position += PieceSquareScore((int)piece.PieceType - 1, piece.IsWhite, piece.Square.Rank, piece.Square.File);
             }
 
-        return material + (position * 2); // * (1 - ((double)board.PlyCount / 50)));
+        return (material + (position)) * (color ? 1 : -1);
     }
 
-    Move[] OrderMoves(Board board, Move[] moves, Move pv_move)
+    Move[] OrderMoves(Board board, Move[] moves)
     {
-        System.Collections.Generic.List<int> scores = new();
+        Move pv_move = m_TPTable[board.ZobristKey & k_TpMask].move; // Either a pv_move or Move.NullMove
+        List<int> scores = new();
 
         foreach (Move move in moves)
         {
             int score = 0;
-            if (move == pv_move) score = 10000;
-            else
-            {
-                if (move.IsCapture) score += 10 * PIECE_SCORES[(int)board.GetPiece(move.TargetSquare).PieceType - 1] - PIECE_SCORES[(int)board.GetPiece(move.StartSquare).PieceType - 1];
-                if (move.IsPromotion) score += PIECE_SCORES[(int)move.PromotionPieceType - 1];
-                // else if (board.SquareIsAttackedByOpponent(move.TargetSquare)) score -= PIECE_SCORES[(int)move.MovePieceType - 1];
-            }
+            if (move == pv_move) score += 10000;
+            else if (move.IsCapture) score += mvv_lva[(int)move.MovePieceType - 1, (int)move.CapturePieceType - 1];
+            if (move.IsPromotion) score += PIECE_VALUES[(int)move.PromotionPieceType - 1];
+
             scores.Add(score);
         }
 
-        System.Array.Sort(scores.ToArray(), moves);
+        Array.Sort(scores.ToArray(), moves);
         return moves.Reverse().ToArray();
     }
 
     public Move Think(Board board, Timer timer)
     {
+        int search_time = timer.MillisecondsRemaining / 50;
         bool myColor = board.IsWhiteToMove;
         sbyte search_depth = 1;
-        int nodes = 0;
+        string fen = board.GetFenString();
 
-        (Move, double) negaMax(Move pv_move, int depth_left, double alpha, double beta, bool color)
+        double negaMax(int depth_left, double alpha, double beta, bool color)
         {
-            nodes++;
-
             // Check time
-            if (timer.MillisecondsElapsedThisTurn > TIME_PER_MOVE) throw new TimeUpV5();
+            if (timer.MillisecondsElapsedThisTurn > search_time) throw new TimeUpV6();
+
+            // Terminal Conditions
+            if (board.IsInCheckmate()) return -10000 + search_depth - depth_left;
+            if (board.IsDraw()) return 0;
+            if (depth_left == 0) return quiesce(alpha, beta, color);
+
+            // Check for entry in transposition table
+            double old_alpha = alpha;
+            ref Transposition t_entry = ref m_TPTable[board.ZobristKey & k_TpMask];
+            if (t_entry.flag != INVALID && t_entry.zobristHash == board.ZobristKey && t_entry.depth >= depth_left)
+            {
+                if (t_entry.flag == EXACT) return t_entry.evaluation;
+                if (t_entry.flag == LOWERBOUND) alpha = Math.Max(alpha, t_entry.evaluation);
+                else if (t_entry.flag == UPPERBOUND) beta = Math.Min(beta, t_entry.evaluation);
+                if (alpha >= beta) return t_entry.evaluation;
+            }
 
             // Generate Moves
             Move[] moves = board.GetLegalMoves();
 
-            // Terminal Conditions
-            if (board.IsInCheckmate()) return (Move.NullMove, ((color == myColor ? 1 : -1) * (board.IsWhiteToMove ? -1 : 1) * (10000 + depth_left)));
-            if (board.IsDraw()) return (Move.NullMove, 0);
-            if (depth_left == 0) return (Move.NullMove, quiesce(alpha, beta, color));
-
             // Initialize Search
-            Move best_move = pv_move;
+            Move best_move = moves[0];
             double best_score = double.NegativeInfinity;
 
-            foreach (Move move in OrderMoves(board, moves, pv_move))
+            foreach (Move move in OrderMoves(board, moves))
             {
                 board.MakeMove(move);
-                (Move pv_move_, double score) = negaMax(Move.NullMove, depth_left - 1, -beta, -alpha, !color);
-                score = -score;
+                double score = -negaMax(depth_left - 1, -beta, -alpha, !color); // negate score before using it. 
                 board.UndoMove(move);
 
                 if (score > best_score) { best_score = score; best_move = move; }
@@ -116,45 +150,54 @@ public class MyBotV5 : IChessBot
                 if (alpha >= beta) break;
             }
 
-            return (best_move, best_score);
+            // Store in Transposition Table
+            t_entry.zobristHash = board.ZobristKey;
+            if (best_score < old_alpha) t_entry.flag = UPPERBOUND; else if (best_score >= beta) t_entry.flag = LOWERBOUND; else t_entry.flag = EXACT;
+            t_entry.evaluation = best_score;
+            t_entry.depth = depth_left;
+            t_entry.move = best_move;
+
+            return best_score;
         }
 
         double quiesce(double alpha, double beta, bool color)
         {
-            nodes++;
             // Check time
-            if (timer.MillisecondsElapsedThisTurn > TIME_PER_MOVE) throw new TimeUpV5();
+            if (timer.MillisecondsElapsedThisTurn > search_time) throw new TimeUpV6();
 
-            double eval = (color == myColor ? 1 : -1) * evaluate(board);
-            if (eval >= beta) return beta;
-            if (alpha < eval) alpha = eval;
+            ref Transposition t_entry = ref m_TPTable[board.ZobristKey & k_TpMask];
+            if (t_entry.flag != INVALID && t_entry.zobristHash == board.ZobristKey && t_entry.depth >= 0)
+            {
+                if (t_entry.flag == EXACT) return t_entry.evaluation;
+                if (t_entry.flag == LOWERBOUND) alpha = Math.Max(alpha, t_entry.evaluation);
+                else if (t_entry.flag == UPPERBOUND) beta = Math.Min(beta, t_entry.evaluation);
+                if (alpha >= beta) return t_entry.evaluation;
+            }
 
-            foreach (Move move in OrderMoves(board, board.GetLegalMoves(true), Move.NullMove))
+            alpha = Math.Max(evaluate(board, color), alpha);
+            if (alpha >= beta) return beta;
+
+            foreach (Move move in OrderMoves(board, board.GetLegalMoves(!board.IsInCheck())))
             {
                 board.MakeMove(move);
                 double score = -quiesce(-beta, -alpha, !color);
                 board.UndoMove(move);
 
-                if (score >= beta) return beta;
-                if (score > alpha) alpha = score;
+                alpha = Math.Max(score, alpha);
+                if (alpha >= beta) break;
             }
             return alpha;
         }
 
         // Iterative Deepening Search
-        Move move = board.GetLegalMoves()[0];
-        double score = 0;
 
-        while (timer.MillisecondsElapsedThisTurn < TIME_PER_MOVE / 2) try
+        while (timer.MillisecondsElapsedThisTurn < search_time / 2 && search_depth < 7) try
             {
-                (move, score) = negaMax(move, search_depth, double.NegativeInfinity, double.PositiveInfinity, true);
-                System.Console.WriteLine(search_depth + " " + move + " " + nodes);
-                nodes = 0;
+                double score = negaMax(search_depth, double.NegativeInfinity, double.PositiveInfinity, board.IsWhiteToMove);
                 search_depth++;
             }
-            catch (TimeUpV5) { }
-        System.Console.WriteLine();
+            catch (TimeUpV6) { }
 
-        return move;
+        return m_TPTable[Board.CreateBoardFromFEN(fen).ZobristKey & k_TpMask].move;
     }
 }
